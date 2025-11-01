@@ -22,8 +22,15 @@ This is an ongoing project that will undergo many changes over time as I learn t
 The project consists of two main components:
 
 1.  **C Tracer (`mem_tracer.c`)**: A shared library that uses `LD_PRELOAD` to hook into the target application's memory functions. It captures allocation data, timestamps, and backtraces, and sends this information over a TCP socket to the local GUI.
+2.  **Python GUI (`gui.py`)**: A local desktop application built with Python's Tkinter. It receives data from the tracer, resolves function names from DWARF debug symbols, and presents the information to the user.*
 
-2.  **Python GUI (`gui.py`)**: A local desktop application built with Python's Tkinter. It receives data from the tracer, resolves function names from DWARF debug symbols, and presents the information to the user.
+_* it may change in future._
+
+## Screens
+
+![allocation-visualizer-1](https://github.com/user-attachments/assets/ce6b3317-c23b-400f-a835-df5156e65544)
+
+
 
 ## Getting Started
 
