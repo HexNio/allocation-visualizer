@@ -3,6 +3,9 @@ import queue
 import local_server
 import bisect
 import math
+import os
+import subprocess
+import glob
 from tkinter import ttk, filedialog
 from elftools.elf.elffile import ELFFile
 
@@ -17,101 +20,206 @@ class MemoryBlock:
         return f"[0x{self.address:x}: 0x{self.address + self.size:x} ({self.size} bytes)]"
 
 class SymbolResolver:
-    def __init__(self, executable_path):
+    def __init__(self, executable_path, cxx_filt_path=None):
         self.executable_path = executable_path
+        self.cxx_filt_path = cxx_filt_path
         self.func_cache = {}
-        self.func_ranges = []
+        self.func_ranges = [] # From DWARF
+        self.dyn_func_addrs = []   # From .dynsym
+        self.dyn_func_names = []   # From .dynsym
+        self.elf_base = 0
+        self.elf_size = 0
+        self.dwarfinfo = None
+
         try:
             self.elffile = ELFFile(open(executable_path, 'rb'))
-            if not self.elffile.has_dwarf_info():
-                print("Executable has no DWARF info.")
-                self.dwarfinfo = None
-                return
+            dwarf_elffile = self.elffile
+            debuglink_section = self.elffile.get_section_by_name('.gnu_debuglink')
+            if debuglink_section:
+                filename_bytes = debuglink_section.data().split(b'\x00')[0]
+                debug_filename = filename_bytes.decode('utf-8', 'ignore')
+                print(f"Found debug link: {debug_filename}")
+                lib_dir = os.path.dirname(self.executable_path)
+                search_paths = [
+                    os.path.join(lib_dir, debug_filename),
+                    os.path.join(lib_dir, '.debug', debug_filename)
+                ]
+                found_debug_file = None
+                for path in search_paths:
+                    if os.path.exists(path):
+                        found_debug_file = path
+                        break
+                if found_debug_file:
+                    print(f"Found debug file at: {found_debug_file}")
+                    dwarf_elffile = ELFFile(open(found_debug_file, 'rb'))
+                else:
+                    print(f"Could not find debug file '{debug_filename}' in search paths.")
 
-            self.dwarfinfo = self.elffile.get_dwarf_info()
-            self._parse_functions()
-
+            has_dwarf = False
+            if dwarf_elffile.has_dwarf_info():
+                self.dwarfinfo = dwarf_elffile.get_dwarf_info()
+                if next(self.dwarfinfo.iter_CUs(), None):
+                    has_dwarf = True
+            if has_dwarf:
+                self._parse_functions()
+            else:
+                self._parse_dynsym()
         except Exception as e:
-            print(f"Error initializing SymbolResolver: {e}")
+            print(f"Error initializing SymbolResolver for '{executable_path}': {e}")
             self.dwarfinfo = None
+
+    def _demangle_subprocess(self, name):
+        if not self.cxx_filt_path or not os.path.exists(self.cxx_filt_path):
+            if not hasattr(self, '_demangle_path_warning'):
+                print(f"""[DEMANGLE DEBUG] c++-filt path not found or invalid.
+Path: {self.cxx_filt_path}
+Mangled names will not be demangled.""" )
+                self._demangle_path_warning = True
+            return name
+        try:
+            proc = subprocess.run(
+                [self.cxx_filt_path],
+                input=name,
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+            if proc.returncode == 0:
+                return proc.stdout.strip()
+            else:
+                # This can happen for non-mangled names, so we don't print an error unless debugging
+                # print(f"[DEMANGLE DEBUG] c++-filt failed for name: '{name}', Stderr: {proc.stderr.strip()}")
+                return name
+        except Exception as e:
+            print(f"[DEMANGLE DEBUG] Exception during demangling: {e}")
+            return name
+
+    def get_total_size(self):
+        if self.elf_size > 0:
+            return self.elf_size
+        max_addr = 0
+        for segment in self.elffile.iter_segments():
+            if segment['p_type'] == 'PT_LOAD':
+                vaddr = segment['p_vaddr']
+                memsz = segment['p_memsz']
+                if vaddr + memsz > max_addr:
+                    max_addr = vaddr + memsz
+        if self.elf_base == 0:
+            for segment in self.elffile.iter_segments():
+                if segment['p_type'] == 'PT_LOAD' and segment['p_offset'] == 0:
+                    self.elf_base = segment['p_vaddr']
+                    break
+        self.elf_size = max_addr - self.elf_base
+        return self.elf_size
 
     def _get_die_name(self, die):
         if 'DW_AT_name' in die.attributes:
             return die.attributes['DW_AT_name'].value.decode('utf-8', 'ignore')
-        
         if 'DW_AT_specification' in die.attributes:
             spec_offset = die.attributes['DW_AT_specification'].value + die.cu.cu_offset
             spec_die = self.dwarfinfo.get_DIE_from_refaddr(spec_offset)
             return self._get_die_name(spec_die)
-
         if 'DW_AT_abstract_origin' in die.attributes:
             ao_offset = die.attributes['DW_AT_abstract_origin'].value + die.cu.cu_offset
             ao_die = self.dwarfinfo.get_DIE_from_refaddr(ao_offset)
             return self._get_die_name(ao_die)
-        
         return None
+
+    def _parse_dynsym(self):
+        print(f"No DWARF info for {self.executable_path}. Falling back to .dynsym.")
+        symtab = self.elffile.get_section_by_name('.dynsym')
+        if not symtab:
+            print("Could not find .dynsym section.")
+            return
+        if self.elf_base == 0:
+            for segment in self.elffile.iter_segments():
+                if segment['p_type'] == 'PT_LOAD' and segment['p_offset'] == 0:
+                    self.elf_base = segment['p_vaddr']
+                    break
+        temp_list = []
+        for sym in symtab.iter_symbols():
+            if sym['st_info']['type'] == 'STT_FUNC' and sym['st_shndx'] != 'SHN_UNDEF':
+                relative_addr = sym['st_value'] - self.elf_base
+                temp_list.append((relative_addr, sym.name))
+        temp_list.sort()
+        if temp_list:
+            self.dyn_func_addrs, self.dyn_func_names = zip(*temp_list)
+        print(f"Found {len(self.dyn_func_addrs)} functions in .dynsym.")
 
     def _parse_functions(self):
         if self.dwarfinfo is None:
             return
-        
-        print("Parsing DWARF info for function ranges...")
-        elf_base = 0
-        for segment in self.elffile.iter_segments():
-            if segment['p_type'] == 'PT_LOAD':
-                elf_base = segment['p_vaddr']
-                break
-
+        print(f"Parsing DWARF info for function ranges in {self.executable_path}...")
+        if self.elf_base == 0:
+            for segment in self.elffile.iter_segments():
+                if segment['p_type'] == 'PT_LOAD' and segment['p_offset'] == 0:
+                    self.elf_base = segment['p_vaddr']
+                    break
+        function_count = 0
+        total_die_count = 0
+        subprogram_die_count = 0
         for CU in self.dwarfinfo.iter_CUs():
             for DIE in CU.iter_DIEs():
+                total_die_count += 1
                 if DIE.tag == 'DW_TAG_subprogram':
+                    subprogram_die_count += 1
                     try:
                         if 'DW_AT_low_pc' not in DIE.attributes:
                             continue
-                        
                         func_name = self._get_die_name(DIE)
                         if func_name is None:
                             continue
-
                         low_pc = DIE.attributes['DW_AT_low_pc'].value
-                        
                         high_pc_attr = DIE.attributes.get('DW_AT_high_pc')
                         if high_pc_attr is None:
                             continue
-                        
                         high_pc = high_pc_attr.value
                         if high_pc_attr.form != 'DW_FORM_addr':
                             high_pc += low_pc
-                        
-                        self.func_ranges.append((low_pc - elf_base, high_pc - elf_base, func_name))
-
+                        self.func_ranges.append((low_pc - self.elf_base, high_pc - self.elf_base, func_name))
+                        function_count += 1
                     except Exception:
                         continue
-        
         self.func_ranges.sort()
-        print(f"Finished parsing. Found {len(self.func_ranges)} functions.")
+        print(f"Finished parsing. Total DIEs: {total_die_count}, Subprogram DIEs: {subprogram_die_count}, Found {function_count} functions.")
 
     def resolve(self, address):
         if address in self.func_cache:
             return self.func_cache[address]
 
-        idx = bisect.bisect_right(self.func_ranges, (address, float('inf')))
-        
-        if idx > 0:
-            start_addr, end_addr, name = self.func_ranges[idx - 1]
-            if start_addr <= address < end_addr:
-                self.func_cache[address] = name
-                return name
+        # DWARF has priority
+        if self.func_ranges:
+            idx = bisect.bisect_right(self.func_ranges, (address, float('inf')))
+            if idx > 0:
+                start_addr, end_addr, name = self.func_ranges[idx - 1]
+                if start_addr <= address < end_addr:
+                    name = self._demangle_subprocess(name)
+                    self.func_cache[address] = name
+                    return name
+        # Fallback to dynsym
+        elif self.dyn_func_addrs:
+            idx = bisect.bisect_right(self.dyn_func_addrs, address)
+            if idx > 0:
+                start_addr = self.dyn_func_addrs[idx - 1]
+                name = self.dyn_func_names[idx - 1]
+                name = self._demangle_subprocess(name)
+                # offset = address - start_addr
+                res_str = name
+                self.func_cache[address] = res_str
+                return res_str
 
-        self.func_cache[address] = f"0x{address:x}"
-        return f"0x{address:x}"
+        res_str = f"0x{address:x}"
+        self.func_cache[address] = res_str
+        return res_str
 
 class StartupDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Select Executable")
-        self.geometry("500x150")
+        self.geometry("500x250") # Adjusted for new field
         self.executable_path = None
+        self.sysroot_path = None
+        self.toolchain_path = None
 
         self.transient(parent)
         
@@ -126,24 +234,41 @@ class StartupDialog(tk.Toplevel):
         main_frame = ttk.Frame(self, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
+        # Executable Path
         ttk.Label(main_frame, text="Please provide the path to the debug-enabled executable:").pack(anchor=tk.W)
-
         path_frame = ttk.Frame(main_frame)
-        path_frame.pack(fill=tk.X, pady=10)
-
+        path_frame.pack(fill=tk.X, pady=5)
         self.path_var = tk.StringVar()
         path_entry = ttk.Entry(path_frame, textvariable=self.path_var)
         path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
         browse_button = ttk.Button(path_frame, text="Browse...", command=self.browse_file)
         browse_button.pack(side=tk.LEFT, padx=(5, 0))
 
+        # Sysroot Path
+        ttk.Label(main_frame, text="Provide an optional sysroot for finding shared libraries:").pack(anchor=tk.W, pady=(10, 0))
+        sysroot_frame = ttk.Frame(main_frame)
+        sysroot_frame.pack(fill=tk.X, pady=5)
+        self.sysroot_var = tk.StringVar()
+        sysroot_entry = ttk.Entry(sysroot_frame, textvariable=self.sysroot_var)
+        sysroot_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        sysroot_browse_button = ttk.Button(sysroot_frame, text="Browse...", command=self.browse_sysroot)
+        sysroot_browse_button.pack(side=tk.LEFT, padx=(5, 0))
+
+        # Toolchain Path
+        ttk.Label(main_frame, text="Full Path to c++-filt.exe (optional):").pack(anchor=tk.W, pady=(10, 0))
+        toolchain_frame = ttk.Frame(main_frame)
+        toolchain_frame.pack(fill=tk.X, pady=5)
+        self.toolchain_var = tk.StringVar()
+        toolchain_entry = ttk.Entry(toolchain_frame, textvariable=self.toolchain_var)
+        toolchain_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        toolchain_browse_button = ttk.Button(toolchain_frame, text="Browse...", command=self.browse_toolchain)
+        toolchain_browse_button.pack(side=tk.LEFT, padx=(5, 0))
+
+        # Dialog Buttons
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(10,0))
-
         continue_button = ttk.Button(button_frame, text="Continue", command=self.on_continue)
         continue_button.pack(side=tk.RIGHT)
-        
         cancel_button = ttk.Button(button_frame, text="Cancel", command=self.on_cancel)
         cancel_button.pack(side=tk.RIGHT, padx=(0, 5))
 
@@ -155,14 +280,28 @@ class StartupDialog(tk.Toplevel):
         if path:
             self.path_var.set(path)
 
+    def browse_sysroot(self):
+        path = filedialog.askdirectory(title="Select Sysroot Directory")
+        if path:
+            self.sysroot_var.set(path)
+
+    def browse_toolchain(self):
+        path = filedialog.askopenfilename(title="Select c++-filt executable")
+        if path:
+            self.toolchain_var.set(path)
+
     def on_continue(self):
         path = self.path_var.get()
         if path:
             self.executable_path = path
+            self.sysroot_path = self.sysroot_var.get()
+            self.toolchain_path = self.toolchain_var.get()
             self.destroy()
 
     def on_cancel(self):
         self.executable_path = None
+        self.sysroot_path = None
+        self.toolchain_path = None
         self.destroy()
 
 class MemoryVisualizer(tk.Tk):
@@ -181,7 +320,10 @@ class MemoryVisualizer(tk.Tk):
 
         self.memory_map = {}
         self.queue = queue.Queue()
-        self.symbol_resolver = None
+        self.symbol_resolvers = [] # List of (start_addr, end_addr, resolver, path)
+        self.sysroot = None
+        self.main_executable_path = None
+        self.toolchain_path = None
         
         # Create an empty placeholder frame initially
         self.placeholder_frame = ttk.Frame(self)
@@ -194,15 +336,17 @@ class MemoryVisualizer(tk.Tk):
         dialog = StartupDialog(self)
         self.wait_window(dialog)
         
-        executable_path = dialog.executable_path
-        if not executable_path:
+        if not dialog.executable_path:
             self.destroy()
             return
+            
+        self.main_executable_path = dialog.executable_path
+        self.sysroot = dialog.sysroot_path
+        self.toolchain_path = dialog.toolchain_path
 
         # Remove placeholder and show actual UI
         self.placeholder_frame.destroy()
         
-        self.symbol_resolver = SymbolResolver(executable_path)
         self.setup_ui()
         local_server.start_server(self.queue)
         self.process_queue()
@@ -287,8 +431,71 @@ class MemoryVisualizer(tk.Tk):
                 if old_addr in self.memory_map:
                     del self.memory_map[old_addr]
                 self.memory_map[new_addr] = MemoryBlock(new_addr, size, backtrace, timestamp)
+            elif command == 'D':
+                path = parts[1]
+                base = int(parts[2], 16)
+                self.add_library_symbols(path, base)
+            elif command == 'X':
+                path = parts[1]
+                self.remove_library_symbols(path)
+
         except (ValueError, IndexError) as e:
             print(f"Skipping malformed line: '{line}'. Error: {e}")
+    
+    def find_library(self, libname):
+        if not self.sysroot or not os.path.isdir(self.sysroot):
+            return None
+        
+        basename = os.path.basename(libname)
+        for root, _, files in os.walk(self.sysroot):
+            if basename in files:
+                return os.path.join(root, basename)
+        return None
+
+    def add_library_symbols(self, path, base):
+        print(f"Library loaded: {path} at 0x{base:x}")
+        
+        full_path = None
+        # The path from the tracer can be different from the one selected by the user
+        # so we check against the basename.
+        if os.path.basename(path) == os.path.basename(self.main_executable_path):
+            full_path = self.main_executable_path
+        else:
+            full_path = self.find_library(path)
+
+        if full_path:
+            print(f"Found library symbols at: {full_path}")
+            resolver = SymbolResolver(full_path, self.toolchain_path)
+            size = resolver.get_total_size()
+            end = base + size
+            self.symbol_resolvers.append((base, end, resolver, path))
+            self.symbol_resolvers.sort()
+        else:
+            print(f"Could not find symbols for {path}")
+            # Add a placeholder so we know the range, but can't resolve
+            # We don't know the size, so we can't create a reliable range.
+            # For now, we skip adding a placeholder for unknown libraries.
+            pass
+            
+    def remove_library_symbols(self, path):
+        print(f"Library unloaded: {path}")
+        self.symbol_resolvers = [r for r in self.symbol_resolvers if r[3] != path]
+
+    def resolve_address(self, addr):
+        # Find the correct symbol resolver based on the address
+        # The list is sorted by base address
+        idx = bisect.bisect_right(self.symbol_resolvers, (addr, float('inf')))
+        if idx > 0:
+            start, end, resolver, path = self.symbol_resolvers[idx-1]
+            if start <= addr < end:
+                if resolver:
+                    vaddr = addr - start
+                    offset = vaddr - resolver.elf_base
+                    return resolver.resolve(offset)
+                else: # No resolver, just show library name and offset
+                    return f"{os.path.basename(path)}+0x{addr-start:x}"
+
+        return f"0x{addr:x}"
 
     def update_ui(self):
         self.update_heatmap_view()
@@ -421,11 +628,12 @@ class MemoryVisualizer(tk.Tk):
             if not block.backtrace:
                 continue
 
-            call_stack = [self.symbol_resolver.resolve(addr) for addr in block.backtrace]
-            app_call_stack = [frame for frame in call_stack if not frame.startswith("0x")]
+            call_stack = [self.resolve_address(addr) for addr in block.backtrace]
+            app_call_stack = [frame for frame in call_stack]
             
             if not app_call_stack:
                 continue
+
 
             app_call_stack.reverse()
 
